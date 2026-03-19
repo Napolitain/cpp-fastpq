@@ -121,6 +121,47 @@ void test_dynamic_alias_type() {
     expect(queue.top() == 33, "dynamic alias maps to the dynamic bucket implementation");
 }
 
+void test_geometric_dynamic_growth() {
+    cpp_pq::dynamic_bucket_priority_queue_geometric<int> queue;
+
+    expect(queue.bucket_count() == 0, "geometric dynamic queue starts with zero configured priorities");
+    queue.push(12, 120);
+    expect(queue.bucket_count() == 13, "geometric dynamic queue tracks the logical priority range");
+
+    queue.push(40, 400);
+    expect(queue.bucket_count() == 41, "geometric dynamic queue grows logically to include the inserted priority");
+    expect(queue.top_priority() == 40, "geometric dynamic queue reports the highest priority");
+    expect(queue.top() == 400, "geometric dynamic queue returns the highest-priority value");
+}
+
+void test_paged_dynamic_sparse_priorities() {
+    cpp_pq::paged_dynamic_bucket_priority_queue<int> queue;
+
+    queue.push(1, 10);
+    queue.push(10000, 20);
+    expect(queue.bucket_count() == 10001, "paged dynamic queue tracks the sparse logical range");
+    expect(queue.top_priority() == 10000, "paged dynamic queue finds the highest sparse priority");
+    expect(queue.top() == 20, "paged dynamic queue returns the sparse highest-priority value");
+
+    queue.pop();
+    expect(queue.top_priority() == 1, "paged dynamic queue falls back across sparse pages");
+}
+
+void test_paged_geometric_dynamic_sparse_priorities() {
+    cpp_pq::paged_dynamic_bucket_priority_queue_geometric<int> queue;
+
+    queue.push(5, 50);
+    queue.push(4097, 4097);
+    queue.push(99999, 99999);
+    expect(queue.bucket_count() == 100000, "paged geometric queue tracks the logical sparse range");
+    expect(queue.top_priority() == 99999, "paged geometric queue returns the highest sparse priority");
+    expect(queue.top() == 99999, "paged geometric queue returns the highest-priority value");
+
+    queue.clear();
+    expect(queue.empty(), "paged geometric queue clear removes all queued items");
+    expect(queue.bucket_count() == 100000, "paged geometric queue clear preserves logical capacity");
+}
+
 void test_registered_sparse_priorities() {
     cpp_pq::registered_bucket_priority_queue<int> queue;
 
@@ -186,6 +227,9 @@ int main() {
         test_large_static_bucket_count();
         test_dynamic_growth();
         test_dynamic_alias_type();
+        test_geometric_dynamic_growth();
+        test_paged_dynamic_sparse_priorities();
+        test_paged_geometric_dynamic_sparse_priorities();
         test_registered_sparse_priorities();
         test_registered_handles_survive_clear();
         test_registered_invalid_handle();

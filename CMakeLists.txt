@@ -43,6 +43,10 @@ if(CPP_PQ_BUILD_BENCHMARKS)
     add_executable(cpp_pq_benchmark benchmarks/benchmark_priority_queues.cpp)
     target_link_libraries(cpp_pq_benchmark PRIVATE cpp_pq::cpp_pq)
     set_target_properties(cpp_pq_benchmark PROPERTIES OUTPUT_NAME benchmark_priority_queues)
+
+    add_executable(cpp_pq_dynamic_variant_benchmark benchmarks/benchmark_dynamic_variants.cpp)
+    target_link_libraries(cpp_pq_dynamic_variant_benchmark PRIVATE cpp_pq::cpp_pq)
+    set_target_properties(cpp_pq_dynamic_variant_benchmark PROPERTIES OUTPUT_NAME benchmark_dynamic_variants)
 endif()
 
 if(CPP_PQ_BUILD_TESTS)

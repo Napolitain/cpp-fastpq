@@ -34,6 +34,14 @@ inline constexpr std::size_t occupancy_word_bits = 64;
     return (occupancy_word_bits - 1) - static_cast<std::size_t>(std::countl_zero(value));
 }
 
+[[nodiscard]] inline std::size_t geometric_capacity(std::size_t required_capacity) noexcept {
+    if (required_capacity == 0) {
+        return 0;
+    }
+
+    return std::bit_ceil(std::max(required_capacity, occupancy_word_bits));
+}
+
 template <std::size_t BucketCount>
 class static_bucket_index {
     static_assert(BucketCount > 0, "static_bucket_index requires at least one bit");
@@ -414,15 +422,15 @@ using static_bucket_priority_queue = bucket_priority_queue<T, BucketCount>;
 template <typename T, std::size_t BucketCount>
 using multi_queue_priority_queue = bucket_priority_queue<T, BucketCount>;
 
-template <typename T>
-class dynamic_bucket_priority_queue {
+template <typename T, bool GeometricGrowth>
+class dynamic_bucket_priority_queue_base {
 public:
     using value_type = T;
     using size_type = std::size_t;
     using priority_type = std::size_t;
     using bucket_type = std::vector<T>;
 
-    explicit dynamic_bucket_priority_queue(size_type bucket_count = 0) {
+    explicit dynamic_bucket_priority_queue_base(size_type bucket_count = 0) {
         expand_priorities(bucket_count);
     }
 
@@ -431,7 +439,7 @@ public:
     }
 
     [[nodiscard]] size_type bucket_count() const noexcept {
-        return buckets_.size();
+        return bucket_count_;
     }
 
     [[nodiscard]] bool empty() const noexcept {
@@ -452,12 +460,12 @@ public:
     }
 
     void expand_priorities(size_type bucket_count) {
-        if (bucket_count <= buckets_.size()) {
+        if (bucket_count <= bucket_count_) {
             return;
         }
 
-        buckets_.resize(bucket_count);
-        occupancy_.expand(bucket_count);
+        bucket_count_ = bucket_count;
+        reserve_capacity(bucket_count_);
     }
 
     template <typename U>
@@ -502,8 +510,18 @@ public:
     }
 
 private:
+    void reserve_capacity(size_type bucket_count) {
+        if (bucket_count <= capacity_) {
+            return;
+        }
+
+        capacity_ = GeometricGrowth ? detail::geometric_capacity(bucket_count) : bucket_count;
+        buckets_.resize(capacity_);
+        occupancy_.expand(capacity_);
+    }
+
     void ensure_priority(priority_type priority) {
-        if (priority >= buckets_.size()) {
+        if (priority >= bucket_count_) {
             expand_priorities(priority + 1);
         }
     }
@@ -526,11 +544,222 @@ private:
 
     std::vector<bucket_type> buckets_{};
     detail::dynamic_bucket_index occupancy_{};
+    size_type bucket_count_{0};
+    size_type capacity_{0};
     size_type size_{0};
 };
 
 template <typename T>
+using dynamic_bucket_priority_queue_exact_growth = dynamic_bucket_priority_queue_base<T, false>;
+
+template <typename T>
+using dynamic_bucket_priority_queue_geometric = dynamic_bucket_priority_queue_base<T, true>;
+
+template <typename T>
+using dynamic_bucket_priority_queue = dynamic_bucket_priority_queue_geometric<T>;
+
+template <typename T>
 using dynamic_multi_queue_priority_queue = dynamic_bucket_priority_queue<T>;
+
+template <typename T, bool GeometricGrowth>
+class paged_dynamic_bucket_priority_queue_base {
+    static constexpr std::size_t page_bucket_count = detail::occupancy_word_bits;
+
+public:
+    using value_type = T;
+    using size_type = std::size_t;
+    using priority_type = std::size_t;
+    using bucket_type = std::vector<T>;
+
+    explicit paged_dynamic_bucket_priority_queue_base(size_type bucket_count = 0) {
+        expand_priorities(bucket_count);
+    }
+
+    [[nodiscard]] static constexpr priority_type min_priority() noexcept {
+        return 0;
+    }
+
+    [[nodiscard]] size_type bucket_count() const noexcept {
+        return bucket_count_;
+    }
+
+    [[nodiscard]] bool empty() const noexcept {
+        return size_ == 0;
+    }
+
+    [[nodiscard]] size_type size() const noexcept {
+        return size_;
+    }
+
+    void clear() {
+        for (auto& page : pages_) {
+            if (!page) {
+                continue;
+            }
+
+            for (auto& bucket : page->buckets_) {
+                bucket.clear();
+            }
+
+            page->occupancy_mask_ = 0;
+        }
+
+        non_empty_pages_.clear();
+        size_ = 0;
+    }
+
+    void expand_priorities(size_type bucket_count) {
+        if (bucket_count <= bucket_count_) {
+            return;
+        }
+
+        bucket_count_ = bucket_count;
+        reserve_page_capacity(detail::words_for_bits(bucket_count_));
+    }
+
+    template <typename U>
+    void push(priority_type priority, U&& value) {
+        ensure_priority(priority);
+
+        const auto next_page_index = page_index(priority);
+        const auto next_bucket_offset = bucket_offset(priority);
+        auto& page = ensure_page(next_page_index);
+        auto& bucket = page.buckets_[next_bucket_offset];
+        const auto bucket_was_empty = bucket.empty();
+        bucket.push_back(std::forward<U>(value));
+
+        if (bucket_was_empty) {
+            page.occupancy_mask_ |= detail::bit_mask(next_bucket_offset);
+            non_empty_pages_.set(next_page_index);
+        }
+
+        ++size_;
+    }
+
+    template <typename... Args>
+    value_type& emplace(priority_type priority, Args&&... args) {
+        ensure_priority(priority);
+
+        const auto next_page_index = page_index(priority);
+        const auto next_bucket_offset = bucket_offset(priority);
+        auto& page = ensure_page(next_page_index);
+        auto& bucket = page.buckets_[next_bucket_offset];
+        const auto bucket_was_empty = bucket.empty();
+        bucket.emplace_back(std::forward<Args>(args)...);
+
+        if (bucket_was_empty) {
+            page.occupancy_mask_ |= detail::bit_mask(next_bucket_offset);
+            non_empty_pages_.set(next_page_index);
+        }
+
+        ++size_;
+        return bucket.back();
+    }
+
+    [[nodiscard]] value_type& top() {
+        return bucket_for_priority(highest_non_empty_priority()).back();
+    }
+
+    [[nodiscard]] const value_type& top() const {
+        return bucket_for_priority(highest_non_empty_priority()).back();
+    }
+
+    [[nodiscard]] priority_type top_priority() const {
+        return highest_non_empty_priority();
+    }
+
+    void pop() {
+        const auto priority = highest_non_empty_priority();
+        auto& page = *pages_[page_index(priority)];
+        auto& bucket = page.buckets_[bucket_offset(priority)];
+        bucket.pop_back();
+        --size_;
+
+        if (bucket.empty()) {
+            page.occupancy_mask_ &= ~detail::bit_mask(bucket_offset(priority));
+
+            if (page.occupancy_mask_ == 0) {
+                non_empty_pages_.reset(page_index(priority));
+            }
+        }
+    }
+
+private:
+    struct page_state {
+        std::array<bucket_type, page_bucket_count> buckets_{};
+        std::uint64_t occupancy_mask_{0};
+    };
+
+    static void require_valid_page_count(size_type page_count) {
+        if (page_count == 0) {
+            return;
+        }
+    }
+
+    void reserve_page_capacity(size_type page_count) {
+        if (page_count <= page_capacity_) {
+            return;
+        }
+
+        require_valid_page_count(page_count);
+        page_capacity_ = GeometricGrowth ? detail::geometric_capacity(page_count) : page_count;
+        pages_.resize(page_capacity_);
+        non_empty_pages_.expand(page_capacity_);
+    }
+
+    void ensure_priority(priority_type priority) {
+        if (priority >= bucket_count_) {
+            expand_priorities(priority + 1);
+        }
+    }
+
+    [[nodiscard]] static constexpr size_type page_index(priority_type priority) noexcept {
+        return detail::word_index(priority);
+    }
+
+    [[nodiscard]] static constexpr size_type bucket_offset(priority_type priority) noexcept {
+        return priority % page_bucket_count;
+    }
+
+    [[nodiscard]] page_state& ensure_page(size_type next_page_index) {
+        if (!pages_[next_page_index]) {
+            pages_[next_page_index] = std::make_unique<page_state>();
+        }
+
+        return *pages_[next_page_index];
+    }
+
+    [[nodiscard]] bucket_type& bucket_for_priority(priority_type priority) {
+        return pages_[page_index(priority)]->buckets_[bucket_offset(priority)];
+    }
+
+    [[nodiscard]] const bucket_type& bucket_for_priority(priority_type priority) const {
+        return pages_[page_index(priority)]->buckets_[bucket_offset(priority)];
+    }
+
+    [[nodiscard]] priority_type highest_non_empty_priority() const {
+        if (empty()) {
+            throw std::out_of_range("paged_dynamic_bucket_priority_queue is empty");
+        }
+
+        const auto highest_page_index = non_empty_pages_.highest_set_bit();
+        const auto& page = *pages_[highest_page_index];
+        const auto highest_bucket_offset = detail::highest_bit_index(page.occupancy_mask_);
+        return (highest_page_index * page_bucket_count) + highest_bucket_offset;
+    }
+
+    std::vector<std::unique_ptr<page_state>> pages_{};
+    detail::dynamic_bucket_index non_empty_pages_{};
+    size_type bucket_count_{0};
+    size_type page_capacity_{0};
+    size_type size_{0};
+};
+
+template <typename T>
+using paged_dynamic_bucket_priority_queue = paged_dynamic_bucket_priority_queue_base<T, false>;
+
+template <typename T>
+using paged_dynamic_bucket_priority_queue_geometric = paged_dynamic_bucket_priority_queue_base<T, true>;
 
 template <typename T>
 class registered_bucket_priority_queue {
