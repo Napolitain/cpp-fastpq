@@ -422,13 +422,16 @@ using static_bucket_priority_queue = bucket_priority_queue<T, BucketCount>;
 template <typename T, std::size_t BucketCount>
 using multi_queue_priority_queue = bucket_priority_queue<T, BucketCount>;
 
-template <typename T, bool GeometricGrowth>
+// Advanced customization point. Prefer the aliases below in application code so the
+// dynamic queue internals can evolve without forcing call-site changes. BucketContainer
+// is expected to be a template<Value, Allocator> with vector-like append/back semantics.
+template <typename T, bool GeometricGrowth, template <typename, typename> class BucketContainer = std::vector>
 class dynamic_bucket_priority_queue_base {
 public:
     using value_type = T;
     using size_type = std::size_t;
     using priority_type = std::size_t;
-    using bucket_type = std::vector<T>;
+    using bucket_type = BucketContainer<T, std::allocator<T>>;
 
     explicit dynamic_bucket_priority_queue_base(size_type bucket_count = 0) {
         expand_priorities(bucket_count);
@@ -552,6 +555,7 @@ private:
 template <typename T>
 using dynamic_bucket_priority_queue_exact_growth = dynamic_bucket_priority_queue_base<T, false>;
 
+// Stable public aliases for the flat dynamic queue family.
 template <typename T>
 using dynamic_bucket_priority_queue_geometric = dynamic_bucket_priority_queue_base<T, true>;
 
@@ -561,6 +565,8 @@ using dynamic_bucket_priority_queue = dynamic_bucket_priority_queue_geometric<T>
 template <typename T>
 using dynamic_multi_queue_priority_queue = dynamic_bucket_priority_queue<T>;
 
+// Advanced sparse-range customization point. Prefer the aliases below in application
+// code unless you intentionally want to opt into a specific paged growth policy.
 template <typename T, bool GeometricGrowth>
 class paged_dynamic_bucket_priority_queue_base {
     static constexpr std::size_t page_bucket_count = detail::occupancy_word_bits;

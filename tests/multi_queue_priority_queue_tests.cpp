@@ -3,6 +3,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 #include "cpp_pq/bucket_priority_queue.hpp"
 
@@ -71,6 +72,36 @@ void test_alias_type() {
     cpp_pq::multi_queue_priority_queue<int, 2> queue;
     queue.push(1, 99);
     expect(queue.top() == 99, "multi_queue alias maps to the bucketed implementation");
+}
+
+void test_public_alias_mappings() {
+    static_assert(std::is_same_v<
+                  cpp_pq::static_bucket_priority_queue<int, 8>,
+                  cpp_pq::bucket_priority_queue<int, 8>>);
+    static_assert(std::is_same_v<
+                  cpp_pq::multi_queue_priority_queue<int, 8>,
+                  cpp_pq::bucket_priority_queue<int, 8>>);
+    static_assert(std::is_same_v<
+                  cpp_pq::dynamic_bucket_priority_queue_exact_growth<int>,
+                  cpp_pq::dynamic_bucket_priority_queue_base<int, false>>);
+    static_assert(std::is_same_v<
+                  cpp_pq::dynamic_bucket_priority_queue_geometric<int>,
+                  cpp_pq::dynamic_bucket_priority_queue_base<int, true>>);
+    static_assert(std::is_same_v<
+                  cpp_pq::dynamic_bucket_priority_queue<int>,
+                  cpp_pq::dynamic_bucket_priority_queue_geometric<int>>);
+    static_assert(std::is_same_v<
+                  cpp_pq::dynamic_multi_queue_priority_queue<int>,
+                  cpp_pq::dynamic_bucket_priority_queue<int>>);
+    static_assert(std::is_same_v<
+                  cpp_pq::paged_dynamic_bucket_priority_queue<int>,
+                  cpp_pq::paged_dynamic_bucket_priority_queue_base<int, false>>);
+    static_assert(std::is_same_v<
+                  cpp_pq::paged_dynamic_bucket_priority_queue_geometric<int>,
+                  cpp_pq::paged_dynamic_bucket_priority_queue_base<int, true>>);
+    static_assert(std::is_same_v<
+                  cpp_pq::registered_multi_queue_priority_queue<int>,
+                  cpp_pq::registered_bucket_priority_queue<int>>);
 }
 
 void test_large_static_bucket_count() {
@@ -224,6 +255,7 @@ int main() {
         test_basic_priority_behavior();
         test_clear_and_bounds();
         test_alias_type();
+        test_public_alias_mappings();
         test_large_static_bucket_count();
         test_dynamic_growth();
         test_dynamic_alias_type();

@@ -13,6 +13,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(CPP_PQ_HAS_FOLLY_FBVECTOR)
+#include <folly/FBVector.h>
+#endif
+
 #include "cpp_pq/bucket_priority_queue.hpp"
 
 namespace {
@@ -177,6 +181,34 @@ private:
     cpp_pq::dynamic_bucket_priority_queue<std::uint64_t> queue_;
 };
 
+#if defined(CPP_PQ_HAS_FOLLY_FBVECTOR)
+class folly_fbvector_dynamic_adapter {
+public:
+    explicit folly_fbvector_dynamic_adapter(std::size_t bucket_count = 0)
+        : queue_(bucket_count) {
+    }
+
+    void push(const item& next_item) {
+        queue_.push(next_item.priority, next_item.value);
+    }
+
+    [[nodiscard]] std::uint64_t top_value() const {
+        return queue_.top();
+    }
+
+    void pop() {
+        queue_.pop();
+    }
+
+    [[nodiscard]] bool empty() const noexcept {
+        return queue_.empty();
+    }
+
+private:
+    cpp_pq::dynamic_bucket_priority_queue_base<std::uint64_t, true, folly::fbvector> queue_;
+};
+#endif
+
 class paged_dynamic_adapter {
 public:
     explicit paged_dynamic_adapter(std::size_t bucket_count = 0)
@@ -326,6 +358,19 @@ void run_all_variants(
             return factory.template operator()<default_dynamic_adapter>();
         }
     ));
+
+#if defined(CPP_PQ_HAS_FOLLY_FBVECTOR)
+    results.push_back(measure(
+        workload_name,
+        "cpp_pq::dynamic_bucket_priority_queue_folly_fbvector",
+        bucket_count,
+        rounds,
+        operations_per_round,
+        [&]() {
+            return factory.template operator()<folly_fbvector_dynamic_adapter>();
+        }
+    ));
+#endif
 
     results.push_back(measure(
         workload_name,
@@ -487,6 +532,13 @@ void write_gains_csv(const std::filesystem::path& output_path, std::span<const g
 
 void print_results(const benchmark_config& config, std::span<const benchmark_result> results) {
     std::cout << "Dynamic priority queue variant benchmark\n";
+    std::cout << "folly_fbvector_variant="
+#if defined(CPP_PQ_HAS_FOLLY_FBVECTOR)
+              << "enabled";
+#else
+              << "disabled";
+#endif
+    std::cout << '\n';
     std::cout << "bulk_items=" << config.bulk_items
               << ", bulk_rounds=" << config.bulk_rounds
               << ", steady_state_size=" << config.steady_state_size
@@ -544,7 +596,13 @@ void print_gains(std::span<const gain_row> gains) {
 int main() {
     const benchmark_config config{};
     std::vector<benchmark_result> results;
-    results.reserve(52);
+    constexpr std::size_t variant_count =
+#if defined(CPP_PQ_HAS_FOLLY_FBVECTOR)
+        5;
+#else
+        4;
+#endif
+    results.reserve(variant_count * 13);
 
     for (const auto bucket_count : {std::size_t{16}, std::size_t{64}, std::size_t{256}, std::size_t{1024}, std::size_t{100000}}) {
         run_dense_suite(config, bucket_count, results);

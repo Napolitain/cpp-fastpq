@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -8,10 +9,16 @@
 #include <queue>
 #include <random>
 #include <span>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <tuple>
-#include <unordered_map>
+#include <utility>
 #include <vector>
+
+#if defined(CPP_PQ_HAS_FOLLY_FBVECTOR)
+#include <folly/FBVector.h>
+#endif
 
 #include "cpp_pq/bucket_priority_queue.hpp"
 
@@ -22,24 +29,75 @@ struct item {
     std::uint64_t value;
 };
 
+enum class range_mode : std::uint8_t {
+    known,
+    growth,
+};
+
+enum class workload_kind : std::uint8_t {
+    bulk_uniform,
+    steady_uniform,
+    steady_hot_set,
+    bulk_sparse_reused,
+    unique_priority,
+    growth_ramp,
+};
+
+struct ratio_case {
+    std::string_view label;
+    std::size_t numerator;
+    std::size_t denominator;
+};
+
+constexpr auto core_ratio_cases = std::to_array<ratio_case>({
+    {"dense", 1, 8},
+    {"balanced", 1, 1},
+    {"sparse", 8, 1},
+});
+
+constexpr auto growth_ramp_ratio_cases = std::to_array<ratio_case>({
+    {"balanced", 1, 1},
+    {"sparse", 8, 1},
+    {"very-sparse", 64, 1},
+});
+
+constexpr std::size_t min_bucket_count = 16;
+constexpr std::size_t max_bucket_count = 1'000'000;
+
 struct benchmark_config {
-    std::size_t bulk_items = 100'000;
-    std::size_t bulk_rounds = 10;
-    std::size_t steady_state_size = 4'096;
-    std::size_t steady_state_operations = 100'000;
-    std::size_t steady_state_rounds = 10;
-    std::size_t edge_bucket_count = 100'000;
-    std::size_t construct_sparse_items = 2'048;
-    std::size_t construct_sparse_rounds = 50;
-    std::size_t unique_priority_rounds = 5;
-    std::size_t growth_ramp_items = 4'096;
-    std::size_t growth_ramp_rounds = 50;
+    std::array<std::size_t, 4> bulk_item_counts{1'000, 10'000, 100'000, 1'000'000};
+    std::array<std::size_t, 3> steady_live_counts{1'000, 10'000, 100'000};
+    std::array<std::size_t, 3> edge_item_counts{1'000, 10'000, 100'000};
+    std::size_t target_total_operations = 1'000'000;
+    std::size_t target_edge_operations = 750'000;
+    std::size_t max_rounds = 512;
+    std::size_t steady_state_multiplier = 10;
+    std::size_t steady_state_min_operations = 10'000;
+    std::size_t steady_state_max_operations = 1'000'000;
+    std::size_t sparse_reused_priority_count = 16;
+    std::size_t hot_set_priority_count = 8;
+    double hot_set_probability = 0.90;
+};
+
+struct benchmark_case {
+    range_mode mode;
+    workload_kind kind;
+    std::string workload;
+    std::string shape;
+    std::size_t item_count;
+    std::size_t bucket_count;
+    std::size_t steady_state_operations;
+    std::size_t rounds;
+    std::uint64_t seed_tag;
 };
 
 struct benchmark_result {
+    std::string range;
     std::string workload;
-    std::string container;
+    std::string shape;
+    std::size_t item_count;
     std::size_t bucket_count;
+    std::string container;
     std::size_t operations;
     double seconds;
     std::uint64_t checksum;
@@ -47,12 +105,82 @@ struct benchmark_result {
 
 using clock_type = std::chrono::steady_clock;
 
+[[nodiscard]] std::string_view range_mode_name(range_mode mode) noexcept {
+    switch (mode) {
+    case range_mode::known:
+        return "known-range";
+    case range_mode::growth:
+        return "growth-range";
+    }
+
+    return "unknown";
+}
+
 std::uint64_t mix_checksum(std::uint64_t checksum, std::uint64_t value) {
     checksum ^= value + 0x9e3779b97f4a7c15ULL + (checksum << 6) + (checksum >> 2);
     return checksum;
 }
 
-std::vector<item> make_items(std::size_t count, std::uint64_t seed, std::size_t bucket_count) {
+[[nodiscard]] std::size_t clamp_bucket_count(std::size_t bucket_count) noexcept {
+    return std::clamp(bucket_count, min_bucket_count, max_bucket_count);
+}
+
+[[nodiscard]] std::size_t bucket_count_for_ratio(std::size_t items, std::size_t numerator, std::size_t denominator) noexcept {
+    const auto requested = (items * numerator + denominator - 1) / denominator;
+    return clamp_bucket_count(requested);
+}
+
+[[nodiscard]] std::size_t scaled_rounds(
+    std::size_t operations_per_round,
+    std::size_t target_total_operations,
+    std::size_t max_rounds
+) noexcept {
+    if (operations_per_round == 0) {
+        return 1;
+    }
+
+    const auto scaled = std::max<std::size_t>(target_total_operations / operations_per_round, 1);
+    return std::min(scaled, max_rounds);
+}
+
+[[nodiscard]] std::size_t steady_state_operation_count(const benchmark_config& config, std::size_t live_items) noexcept {
+    const auto scaled = live_items * config.steady_state_multiplier;
+    return std::clamp(scaled, config.steady_state_min_operations, config.steady_state_max_operations);
+}
+
+[[nodiscard]] std::uint64_t case_seed(const benchmark_case& next_case, std::uint64_t salt) noexcept {
+    auto seed = salt;
+    seed = mix_checksum(seed, static_cast<std::uint64_t>(next_case.mode));
+    seed = mix_checksum(seed, static_cast<std::uint64_t>(next_case.kind));
+    seed = mix_checksum(seed, next_case.item_count);
+    seed = mix_checksum(seed, next_case.bucket_count);
+    seed = mix_checksum(seed, next_case.steady_state_operations);
+    seed = mix_checksum(seed, next_case.seed_tag);
+    return seed;
+}
+
+std::vector<std::size_t> make_sparse_priority_set(std::size_t bucket_count, std::size_t distinct_priority_count) {
+    if (bucket_count == 0 || distinct_priority_count == 0) {
+        return {};
+    }
+
+    const auto actual_count = std::min(bucket_count, distinct_priority_count);
+    std::vector<std::size_t> priorities;
+    priorities.reserve(actual_count);
+
+    if (actual_count == 1) {
+        priorities.push_back(bucket_count - 1);
+        return priorities;
+    }
+
+    for (std::size_t index = 0; index < actual_count; ++index) {
+        priorities.push_back((index * (bucket_count - 1)) / (actual_count - 1));
+    }
+
+    return priorities;
+}
+
+std::vector<item> make_uniform_items(std::size_t count, std::uint64_t seed, std::size_t bucket_count) {
     std::mt19937_64 generator(seed);
     std::uniform_int_distribution<std::size_t> priority_distribution(0, bucket_count - 1);
 
@@ -69,12 +197,66 @@ std::vector<item> make_items(std::size_t count, std::uint64_t seed, std::size_t 
     return items;
 }
 
-std::vector<item> make_unique_priority_items(std::size_t bucket_count, std::uint64_t seed) {
+std::vector<item> make_hot_set_items(
+    std::size_t count,
+    std::uint64_t seed,
+    std::size_t bucket_count,
+    std::size_t hot_priority_count,
+    double hot_probability
+) {
     std::mt19937_64 generator(seed);
-    std::vector<item> items;
-    items.reserve(bucket_count);
+    std::bernoulli_distribution use_hot_priority(hot_probability);
+    std::uniform_int_distribution<std::size_t> full_distribution(0, bucket_count - 1);
 
-    for (std::size_t priority = 0; priority < bucket_count; ++priority) {
+    const auto actual_hot_priority_count = std::min(bucket_count, std::max<std::size_t>(hot_priority_count, 1));
+    const auto hot_priority_floor = bucket_count - actual_hot_priority_count;
+    std::uniform_int_distribution<std::size_t> hot_distribution(hot_priority_floor, bucket_count - 1);
+
+    std::vector<item> items;
+    items.reserve(count);
+
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto priority = use_hot_priority(generator) ? hot_distribution(generator) : full_distribution(generator);
+        items.push_back(item{
+            priority,
+            generator(),
+        });
+    }
+
+    return items;
+}
+
+std::vector<item> make_sparse_reused_items(
+    std::size_t count,
+    std::uint64_t seed,
+    std::size_t bucket_count,
+    std::size_t distinct_priority_count
+) {
+    std::mt19937_64 generator(seed);
+    const auto priorities = make_sparse_priority_set(bucket_count, distinct_priority_count);
+    std::uniform_int_distribution<std::size_t> priority_distribution(0, priorities.size() - 1);
+
+    std::vector<item> items;
+    items.reserve(count);
+
+    for (std::size_t index = 0; index < count; ++index) {
+        items.push_back(item{
+            priorities[priority_distribution(generator)],
+            generator(),
+        });
+    }
+
+    return items;
+}
+
+std::vector<item> make_unique_priority_items(std::size_t count, std::uint64_t seed, std::size_t bucket_count) {
+    std::mt19937_64 generator(seed);
+    const auto priorities = make_sparse_priority_set(bucket_count, count);
+
+    std::vector<item> items;
+    items.reserve(priorities.size());
+
+    for (const auto priority : priorities) {
         items.push_back(item{
             priority,
             generator(),
@@ -164,39 +346,15 @@ private:
     cpp_pq::dynamic_bucket_priority_queue<std::uint64_t> queue_;
 };
 
-class registered_bucket_queue_adapter {
+#if defined(CPP_PQ_HAS_FOLLY_FBVECTOR)
+class fbvector_dynamic_bucket_queue_adapter {
 public:
-    struct registered_item {
-        cpp_pq::registered_bucket_priority_queue<std::uint64_t>::priority_handle handle;
-        std::uint64_t value;
-    };
-
-    explicit registered_bucket_queue_adapter(std::span<const item> items) {
-        registrations_.reserve(items.size());
-
-        for (const auto& next_item : items) {
-            if (registrations_.find(next_item.priority) == registrations_.end()) {
-                registrations_.emplace(next_item.priority, queue_.register_priority(next_item.priority));
-            }
-        }
+    explicit fbvector_dynamic_bucket_queue_adapter(std::size_t bucket_count = 0)
+        : queue_(bucket_count) {
     }
 
-    [[nodiscard]] std::vector<registered_item> bind_items(std::span<const item> items) const {
-        std::vector<registered_item> bound_items;
-        bound_items.reserve(items.size());
-
-        for (const auto& next_item : items) {
-            bound_items.push_back(registered_item{
-                registrations_.at(next_item.priority),
-                next_item.value,
-            });
-        }
-
-        return bound_items;
-    }
-
-    void push(const registered_item& next_item) {
-        queue_.push(next_item.handle, next_item.value);
+    void push(const item& next_item) {
+        queue_.push(next_item.priority, next_item.value);
     }
 
     [[nodiscard]] std::uint64_t top_value() const {
@@ -212,9 +370,9 @@ public:
     }
 
 private:
-    cpp_pq::registered_bucket_priority_queue<std::uint64_t> queue_{};
-    std::unordered_map<std::size_t, cpp_pq::registered_bucket_priority_queue<std::uint64_t>::priority_handle> registrations_{};
+    cpp_pq::dynamic_bucket_priority_queue_base<std::uint64_t, true, folly::fbvector> queue_;
 };
+#endif
 
 struct priority_entry {
     std::size_t priority;
@@ -293,10 +451,8 @@ std::uint64_t run_steady_state_round(Queue& queue, const SeedRange& seed_items, 
 
 template <typename Workload>
 benchmark_result measure(
-    std::string workload_name,
+    const benchmark_case& next_case,
     std::string container_name,
-    std::size_t bucket_count,
-    std::size_t rounds,
     std::size_t operations_per_round,
     Workload&& workload
 ) {
@@ -305,7 +461,7 @@ benchmark_result measure(
     std::uint64_t checksum = 0;
     const auto start = clock_type::now();
 
-    for (std::size_t round = 0; round < rounds; ++round) {
+    for (std::size_t round = 0; round < next_case.rounds; ++round) {
         checksum = mix_checksum(checksum, workload());
     }
 
@@ -313,339 +469,430 @@ benchmark_result measure(
     const auto elapsed = std::chrono::duration<double>(finish - start).count();
 
     return benchmark_result{
-        std::move(workload_name),
+        std::string(range_mode_name(next_case.mode)),
+        next_case.workload,
+        next_case.shape,
+        next_case.item_count,
+        next_case.bucket_count,
         std::move(container_name),
-        bucket_count,
-        rounds * operations_per_round,
+        next_case.rounds * operations_per_round,
         elapsed,
         checksum,
     };
 }
 
 template <std::size_t BucketCount>
-void run_suite(const benchmark_config& config, std::vector<benchmark_result>& results) {
-    const auto bulk_items = make_items(config.bulk_items, 0xBADC0FFEULL + BucketCount, BucketCount);
-    const auto steady_seed_items = make_items(config.steady_state_size, 0x12345678ULL + BucketCount, BucketCount);
-    const auto steady_operation_items = make_items(config.steady_state_operations, 0xCAFEBABELL + BucketCount, BucketCount);
-    auto steady_registration_items = steady_seed_items;
-    steady_registration_items.insert(steady_registration_items.end(), steady_operation_items.begin(), steady_operation_items.end());
-    registered_bucket_queue_adapter registered_bulk_queue(bulk_items);
-    const auto registered_bulk_items = registered_bulk_queue.bind_items(bulk_items);
-    registered_bucket_queue_adapter registered_steady_queue(steady_registration_items);
-    const auto registered_steady_seed_items = registered_steady_queue.bind_items(steady_seed_items);
-    const auto registered_steady_operation_items = registered_steady_queue.bind_items(steady_operation_items);
+void benchmark_bulk_case(
+    const benchmark_case& next_case,
+    std::span<const item> items,
+    std::vector<benchmark_result>& results
+) {
+    const auto operations_per_round = items.size() * 3;
 
-    const auto bulk_operations = config.bulk_items * 3;
-    const auto steady_state_operations = (config.steady_state_size * 3) + (config.steady_state_operations * 3);
-
-    {
-        std_priority_queue_adapter queue;
+    auto add_result = [&](std::string_view container_name, auto&& workload) {
         results.push_back(measure(
-            "bulk-fill-drain",
-            "std::priority_queue",
-            BucketCount,
-            config.bulk_rounds,
-            bulk_operations,
-            [&]() {
-                return run_bulk_round(queue, bulk_items);
-            }
+            next_case,
+            std::string(container_name),
+            operations_per_round,
+            std::forward<decltype(workload)>(workload)
         ));
-    }
+    };
 
-    {
-        auto queue = std::make_unique<static_bucket_queue_adapter<BucketCount>>();
-        results.push_back(measure(
-            "bulk-fill-drain",
-            "cpp_pq::static_bucket_priority_queue",
-            BucketCount,
-            config.bulk_rounds,
-            bulk_operations,
-            [&]() {
-                return run_bulk_round(*queue, bulk_items);
-            }
-        ));
-    }
+    std_priority_queue_adapter std_queue;
+    add_result("std::priority_queue", [&]() {
+        return run_bulk_round(std_queue, items);
+    });
 
-    {
-        dynamic_bucket_queue_adapter queue(BucketCount);
-        results.push_back(measure(
-            "bulk-fill-drain",
-            "cpp_pq::dynamic_bucket_priority_queue",
-            BucketCount,
-            config.bulk_rounds,
-            bulk_operations,
-            [&]() {
-                return run_bulk_round(queue, bulk_items);
-            }
-        ));
-    }
+    auto static_queue = std::make_unique<static_bucket_queue_adapter<BucketCount>>();
+    add_result("cpp_pq::static_bucket_priority_queue", [&]() {
+        return run_bulk_round(*static_queue, items);
+    });
 
-    {
-        results.push_back(measure(
-            "bulk-fill-drain",
-            "cpp_pq::registered_bucket_priority_queue",
-            BucketCount,
-            config.bulk_rounds,
-            bulk_operations,
-            [&]() {
-                return run_bulk_round(registered_bulk_queue, registered_bulk_items);
-            }
-        ));
-    }
+    if (next_case.mode == range_mode::known) {
+        dynamic_bucket_queue_adapter dynamic_queue(BucketCount);
+        add_result("cpp_pq::dynamic_bucket_priority_queue", [&]() {
+            return run_bulk_round(dynamic_queue, items);
+        });
 
-    {
-        std_priority_queue_adapter queue;
-        results.push_back(measure(
-            "steady-state",
-            "std::priority_queue",
-            BucketCount,
-            config.steady_state_rounds,
-            steady_state_operations,
-            [&]() {
-                return run_steady_state_round(queue, steady_seed_items, steady_operation_items);
-            }
-        ));
-    }
+#if defined(CPP_PQ_HAS_FOLLY_FBVECTOR)
+        fbvector_dynamic_bucket_queue_adapter fbvector_queue(BucketCount);
+        add_result("cpp_pq::dynamic_bucket_priority_queue_folly_fbvector", [&]() {
+            return run_bulk_round(fbvector_queue, items);
+        });
+#endif
+    } else {
+        add_result("cpp_pq::dynamic_bucket_priority_queue", [&]() {
+            dynamic_bucket_queue_adapter dynamic_queue;
+            return run_bulk_round(dynamic_queue, items);
+        });
 
-    {
-        auto queue = std::make_unique<static_bucket_queue_adapter<BucketCount>>();
-        results.push_back(measure(
-            "steady-state",
-            "cpp_pq::static_bucket_priority_queue",
-            BucketCount,
-            config.steady_state_rounds,
-            steady_state_operations,
-            [&]() {
-                return run_steady_state_round(*queue, steady_seed_items, steady_operation_items);
-            }
-        ));
-    }
-
-    {
-        dynamic_bucket_queue_adapter queue(BucketCount);
-        results.push_back(measure(
-            "steady-state",
-            "cpp_pq::dynamic_bucket_priority_queue",
-            BucketCount,
-            config.steady_state_rounds,
-            steady_state_operations,
-            [&]() {
-                return run_steady_state_round(queue, steady_seed_items, steady_operation_items);
-            }
-        ));
-    }
-
-    {
-        results.push_back(measure(
-            "steady-state",
-            "cpp_pq::registered_bucket_priority_queue",
-            BucketCount,
-            config.steady_state_rounds,
-            steady_state_operations,
-            [&]() {
-                return run_steady_state_round(registered_steady_queue, registered_steady_seed_items, registered_steady_operation_items);
-            }
-        ));
+#if defined(CPP_PQ_HAS_FOLLY_FBVECTOR)
+        add_result("cpp_pq::dynamic_bucket_priority_queue_folly_fbvector", [&]() {
+            fbvector_dynamic_bucket_queue_adapter fbvector_queue;
+            return run_bulk_round(fbvector_queue, items);
+        });
+#endif
     }
 }
 
 template <std::size_t BucketCount>
-void run_edge_case_suite(const benchmark_config& config, std::vector<benchmark_result>& results) {
-    const auto sparse_items = make_items(config.construct_sparse_items, 0x0B5EEDULL + BucketCount, BucketCount);
-    const auto unique_priority_items = make_unique_priority_items(BucketCount, 0x51A1EULL + BucketCount);
-    const auto growth_ramp_items = make_growth_ramp_items(config.growth_ramp_items, 0x6A0EULL + BucketCount, BucketCount);
-    registered_bucket_queue_adapter sparse_registered_queue(sparse_items);
-    const auto sparse_registered_items = sparse_registered_queue.bind_items(sparse_items);
-    registered_bucket_queue_adapter unique_registered_queue(unique_priority_items);
-    const auto unique_registered_items = unique_registered_queue.bind_items(unique_priority_items);
-    registered_bucket_queue_adapter growth_registered_queue(growth_ramp_items);
-    const auto growth_registered_items = growth_registered_queue.bind_items(growth_ramp_items);
+void benchmark_steady_case(
+    const benchmark_case& next_case,
+    std::span<const item> seed_items,
+    std::span<const item> operation_items,
+    std::vector<benchmark_result>& results
+) {
+    const auto operations_per_round = (seed_items.size() * 3) + (operation_items.size() * 3);
 
-    {
-        const auto operations_per_round = sparse_items.size() * 3;
-
+    auto add_result = [&](std::string_view container_name, auto&& workload) {
         results.push_back(measure(
-            "construct-sparse",
-            "std::priority_queue",
-            BucketCount,
-            config.construct_sparse_rounds,
+            next_case,
+            std::string(container_name),
             operations_per_round,
-            [&]() {
-                std_priority_queue_adapter queue;
-                return run_bulk_round(queue, sparse_items);
-            }
+            std::forward<decltype(workload)>(workload)
         ));
+    };
 
-        results.push_back(measure(
-            "construct-sparse",
-            "cpp_pq::static_bucket_priority_queue",
-            BucketCount,
-            config.construct_sparse_rounds,
-            operations_per_round,
-            [&]() {
-                auto queue = std::make_unique<static_bucket_queue_adapter<BucketCount>>();
-                return run_bulk_round(*queue, sparse_items);
-            }
-        ));
+    std_priority_queue_adapter std_queue;
+    add_result("std::priority_queue", [&]() {
+        return run_steady_state_round(std_queue, seed_items, operation_items);
+    });
 
-        results.push_back(measure(
-            "construct-sparse",
-            "cpp_pq::dynamic_bucket_priority_queue",
-            BucketCount,
-            config.construct_sparse_rounds,
-            operations_per_round,
-            [&]() {
-                dynamic_bucket_queue_adapter queue(BucketCount);
-                return run_bulk_round(queue, sparse_items);
-            }
-        ));
+    auto static_queue = std::make_unique<static_bucket_queue_adapter<BucketCount>>();
+    add_result("cpp_pq::static_bucket_priority_queue", [&]() {
+        return run_steady_state_round(*static_queue, seed_items, operation_items);
+    });
 
-        results.push_back(measure(
-            "construct-sparse",
-            "cpp_pq::registered_bucket_priority_queue",
-            BucketCount,
-            config.construct_sparse_rounds,
-            operations_per_round,
-            [&]() {
-                return run_bulk_round(sparse_registered_queue, sparse_registered_items);
-            }
-        ));
-    }
+    if (next_case.mode == range_mode::known) {
+        dynamic_bucket_queue_adapter dynamic_queue(BucketCount);
+        add_result("cpp_pq::dynamic_bucket_priority_queue", [&]() {
+            return run_steady_state_round(dynamic_queue, seed_items, operation_items);
+        });
 
-    {
-        const auto operations_per_round = unique_priority_items.size() * 3;
+#if defined(CPP_PQ_HAS_FOLLY_FBVECTOR)
+        fbvector_dynamic_bucket_queue_adapter fbvector_queue(BucketCount);
+        add_result("cpp_pq::dynamic_bucket_priority_queue_folly_fbvector", [&]() {
+            return run_steady_state_round(fbvector_queue, seed_items, operation_items);
+        });
+#endif
+    } else {
+        add_result("cpp_pq::dynamic_bucket_priority_queue", [&]() {
+            dynamic_bucket_queue_adapter dynamic_queue;
+            return run_steady_state_round(dynamic_queue, seed_items, operation_items);
+        });
 
-        results.push_back(measure(
-            "unique-priority",
-            "std::priority_queue",
-            BucketCount,
-            config.unique_priority_rounds,
-            operations_per_round,
-            [&]() {
-                std_priority_queue_adapter queue;
-                return run_bulk_round(queue, unique_priority_items);
-            }
-        ));
-
-        results.push_back(measure(
-            "unique-priority",
-            "cpp_pq::static_bucket_priority_queue",
-            BucketCount,
-            config.unique_priority_rounds,
-            operations_per_round,
-            [&]() {
-                auto queue = std::make_unique<static_bucket_queue_adapter<BucketCount>>();
-                return run_bulk_round(*queue, unique_priority_items);
-            }
-        ));
-
-        results.push_back(measure(
-            "unique-priority",
-            "cpp_pq::dynamic_bucket_priority_queue",
-            BucketCount,
-            config.unique_priority_rounds,
-            operations_per_round,
-            [&]() {
-                dynamic_bucket_queue_adapter queue(BucketCount);
-                return run_bulk_round(queue, unique_priority_items);
-            }
-        ));
-
-        results.push_back(measure(
-            "unique-priority",
-            "cpp_pq::registered_bucket_priority_queue",
-            BucketCount,
-            config.unique_priority_rounds,
-            operations_per_round,
-            [&]() {
-                return run_bulk_round(unique_registered_queue, unique_registered_items);
-            }
-        ));
-    }
-
-    {
-        const auto operations_per_round = growth_ramp_items.size() * 3;
-
-        results.push_back(measure(
-            "growth-ramp",
-            "std::priority_queue",
-            BucketCount,
-            config.growth_ramp_rounds,
-            operations_per_round,
-            [&]() {
-                std_priority_queue_adapter queue;
-                return run_bulk_round(queue, growth_ramp_items);
-            }
-        ));
-
-        results.push_back(measure(
-            "growth-ramp",
-            "cpp_pq::static_bucket_priority_queue",
-            BucketCount,
-            config.growth_ramp_rounds,
-            operations_per_round,
-            [&]() {
-                auto queue = std::make_unique<static_bucket_queue_adapter<BucketCount>>();
-                return run_bulk_round(*queue, growth_ramp_items);
-            }
-        ));
-
-        results.push_back(measure(
-            "growth-ramp",
-            "cpp_pq::dynamic_bucket_priority_queue",
-            BucketCount,
-            config.growth_ramp_rounds,
-            operations_per_round,
-            [&]() {
-                dynamic_bucket_queue_adapter queue;
-                return run_bulk_round(queue, growth_ramp_items);
-            }
-        ));
-
-        results.push_back(measure(
-            "growth-ramp",
-            "cpp_pq::registered_bucket_priority_queue",
-            BucketCount,
-            config.growth_ramp_rounds,
-            operations_per_round,
-            [&]() {
-                return run_bulk_round(growth_registered_queue, growth_registered_items);
-            }
-        ));
+#if defined(CPP_PQ_HAS_FOLLY_FBVECTOR)
+        add_result("cpp_pq::dynamic_bucket_priority_queue_folly_fbvector", [&]() {
+            fbvector_dynamic_bucket_queue_adapter fbvector_queue;
+            return run_steady_state_round(fbvector_queue, seed_items, operation_items);
+        });
+#endif
     }
 }
 
+template <std::size_t BucketCount>
+void run_case(
+    const benchmark_config& config,
+    const benchmark_case& next_case,
+    std::vector<benchmark_result>& results
+) {
+    switch (next_case.kind) {
+    case workload_kind::bulk_uniform: {
+        const auto items = make_uniform_items(next_case.item_count, case_seed(next_case, 0xBADC0FFEULL), BucketCount);
+        benchmark_bulk_case<BucketCount>(next_case, items, results);
+        return;
+    }
+
+    case workload_kind::steady_uniform: {
+        const auto seed_items = make_uniform_items(next_case.item_count, case_seed(next_case, 0x12345678ULL), BucketCount);
+        const auto operation_items = make_uniform_items(
+            next_case.steady_state_operations,
+            case_seed(next_case, 0xCAFEBABELL),
+            BucketCount
+        );
+        benchmark_steady_case<BucketCount>(next_case, seed_items, operation_items, results);
+        return;
+    }
+
+    case workload_kind::steady_hot_set: {
+        const auto seed_items = make_hot_set_items(
+            next_case.item_count,
+            case_seed(next_case, 0xA11CEULL),
+            BucketCount,
+            config.hot_set_priority_count,
+            config.hot_set_probability
+        );
+        const auto operation_items = make_hot_set_items(
+            next_case.steady_state_operations,
+            case_seed(next_case, 0xFACEFEEDULL),
+            BucketCount,
+            config.hot_set_priority_count,
+            config.hot_set_probability
+        );
+        benchmark_steady_case<BucketCount>(next_case, seed_items, operation_items, results);
+        return;
+    }
+
+    case workload_kind::bulk_sparse_reused: {
+        const auto items = make_sparse_reused_items(
+            next_case.item_count,
+            case_seed(next_case, 0x0B5EEDULL),
+            BucketCount,
+            config.sparse_reused_priority_count
+        );
+        benchmark_bulk_case<BucketCount>(next_case, items, results);
+        return;
+    }
+
+    case workload_kind::unique_priority: {
+        const auto items = make_unique_priority_items(next_case.item_count, case_seed(next_case, 0x51A1EULL), BucketCount);
+        benchmark_bulk_case<BucketCount>(next_case, items, results);
+        return;
+    }
+
+    case workload_kind::growth_ramp: {
+        const auto items = make_growth_ramp_items(next_case.item_count, case_seed(next_case, 0x6A0EULL), BucketCount);
+        benchmark_bulk_case<BucketCount>(next_case, items, results);
+        return;
+    }
+    }
+}
+
+template <typename Fn>
+void dispatch_bucket_count(std::size_t bucket_count, Fn&& fn) {
+    switch (bucket_count) {
+    case 125:
+        fn.template operator()<125>();
+        return;
+    case 1'000:
+        fn.template operator()<1'000>();
+        return;
+    case 1'250:
+        fn.template operator()<1'250>();
+        return;
+    case 8'000:
+        fn.template operator()<8'000>();
+        return;
+    case 10'000:
+        fn.template operator()<10'000>();
+        return;
+    case 12'500:
+        fn.template operator()<12'500>();
+        return;
+    case 64'000:
+        fn.template operator()<64'000>();
+        return;
+    case 80'000:
+        fn.template operator()<80'000>();
+        return;
+    case 100'000:
+        fn.template operator()<100'000>();
+        return;
+    case 125'000:
+        fn.template operator()<125'000>();
+        return;
+    case 640'000:
+        fn.template operator()<640'000>();
+        return;
+    case 800'000:
+        fn.template operator()<800'000>();
+        return;
+    case 1'000'000:
+        fn.template operator()<1'000'000>();
+        return;
+    default:
+        throw std::invalid_argument("Unsupported benchmark bucket count");
+    }
+}
+
+std::vector<benchmark_case> build_cases(const benchmark_config& config) {
+    std::vector<benchmark_case> cases;
+    std::uint64_t next_seed_tag = 1;
+
+    auto append_case = [&](range_mode mode,
+                           workload_kind kind,
+                           std::string workload,
+                           std::string shape,
+                           std::size_t item_count,
+                           std::size_t bucket_count,
+                           std::size_t steady_state_operations,
+                           std::size_t rounds) {
+        cases.push_back(benchmark_case{
+            mode,
+            kind,
+            std::move(workload),
+            std::move(shape),
+            item_count,
+            bucket_count,
+            steady_state_operations,
+            rounds,
+            next_seed_tag++,
+        });
+    };
+
+    for (const auto mode : {range_mode::known, range_mode::growth}) {
+        for (const auto item_count : config.bulk_item_counts) {
+            std::size_t previous_bucket_count = 0;
+
+            for (const auto& ratio : core_ratio_cases) {
+                const auto bucket_count = bucket_count_for_ratio(item_count, ratio.numerator, ratio.denominator);
+                if (bucket_count == previous_bucket_count) {
+                    continue;
+                }
+
+                previous_bucket_count = bucket_count;
+                const auto operations_per_round = item_count * 3;
+                append_case(
+                    mode,
+                    workload_kind::bulk_uniform,
+                    "bulk-fill-drain",
+                    std::string(ratio.label),
+                    item_count,
+                    bucket_count,
+                    0,
+                    scaled_rounds(operations_per_round, config.target_total_operations, config.max_rounds)
+                );
+            }
+        }
+
+        for (const auto live_items : config.steady_live_counts) {
+            std::size_t previous_bucket_count = 0;
+            const auto steady_operations = steady_state_operation_count(config, live_items);
+
+            for (const auto& ratio : core_ratio_cases) {
+                const auto bucket_count = bucket_count_for_ratio(live_items, ratio.numerator, ratio.denominator);
+                if (bucket_count == previous_bucket_count) {
+                    continue;
+                }
+
+                previous_bucket_count = bucket_count;
+                const auto operations_per_round = (live_items * 3) + (steady_operations * 3);
+                append_case(
+                    mode,
+                    workload_kind::steady_uniform,
+                    "steady-state",
+                    std::string(ratio.label),
+                    live_items,
+                    bucket_count,
+                    steady_operations,
+                    scaled_rounds(operations_per_round, config.target_total_operations, config.max_rounds)
+                );
+            }
+
+            const auto hot_set_bucket_count = bucket_count_for_ratio(live_items, 1, 1);
+            const auto hot_set_operations_per_round = (live_items * 3) + (steady_operations * 3);
+            append_case(
+                mode,
+                workload_kind::steady_hot_set,
+                "steady-state",
+                "hot-set",
+                live_items,
+                hot_set_bucket_count,
+                steady_operations,
+                scaled_rounds(hot_set_operations_per_round, config.target_total_operations, config.max_rounds)
+            );
+        }
+
+        for (const auto item_count : config.edge_item_counts) {
+            const auto bucket_count = bucket_count_for_ratio(item_count, 64, 1);
+            const auto operations_per_round = item_count * 3;
+            append_case(
+                mode,
+                workload_kind::bulk_sparse_reused,
+                "bulk-fill-drain",
+                "sparse-reused",
+                item_count,
+                bucket_count,
+                0,
+                scaled_rounds(operations_per_round, config.target_total_operations, config.max_rounds)
+            );
+        }
+    }
+
+    for (const auto item_count : config.edge_item_counts) {
+        const auto operations_per_round = item_count * 3;
+        append_case(
+            range_mode::known,
+            workload_kind::unique_priority,
+            "unique-priority",
+            "edge",
+            item_count,
+            bucket_count_for_ratio(item_count, 1, 1),
+            0,
+            scaled_rounds(operations_per_round, config.target_edge_operations, config.max_rounds)
+        );
+    }
+
+    for (const auto item_count : config.edge_item_counts) {
+        std::size_t previous_bucket_count = 0;
+
+        for (const auto& ratio : growth_ramp_ratio_cases) {
+            const auto bucket_count = bucket_count_for_ratio(item_count, ratio.numerator, ratio.denominator);
+            if (bucket_count == previous_bucket_count) {
+                continue;
+            }
+
+            previous_bucket_count = bucket_count;
+            const auto operations_per_round = std::min(item_count, bucket_count) * 3;
+            append_case(
+                range_mode::growth,
+                workload_kind::growth_ramp,
+                "growth-ramp",
+                std::string(ratio.label),
+                item_count,
+                bucket_count,
+                0,
+                scaled_rounds(operations_per_round, config.target_edge_operations, config.max_rounds)
+            );
+        }
+    }
+
+    return cases;
+}
+
+[[nodiscard]] double ns_per_operation(const benchmark_result& result) {
+    return (result.seconds * 1'000'000'000.0) / static_cast<double>(result.operations);
+}
+
 void print_results(const benchmark_config& config, std::span<const benchmark_result> results) {
-    std::cout << "Bounded-priority queue microbenchmark\n";
-    std::cout << "bulk_items=" << config.bulk_items
-              << ", bulk_rounds=" << config.bulk_rounds
-              << ", steady_state_size=" << config.steady_state_size
-              << ", steady_state_operations=" << config.steady_state_operations
-              << ", steady_state_rounds=" << config.steady_state_rounds
-              << ", edge_bucket_count=" << config.edge_bucket_count
-              << ", construct_sparse_items=" << config.construct_sparse_items
-              << ", unique_priority_items=" << config.edge_bucket_count
-              << ", growth_ramp_items=" << config.growth_ramp_items << "\n\n";
+    std::cout << "Bounded-priority queue benchmark matrix\n";
+    std::cout << "bulk_items={1k,10k,100k,1m}, steady_live={1k,10k,100k}, core_ratios={1/8,1,8}\n";
+    std::cout << "known-range: dynamic variants are pre-sized to the final bucket range\n";
+    std::cout << "growth-range: dynamic variants start empty each measured run and pay the expansion cost in-band\n";
+#if defined(CPP_PQ_HAS_FOLLY_FBVECTOR)
+    std::cout << "fbvector variant: enabled\n";
+#else
+    std::cout << "fbvector variant: disabled (configure with -DCPP_PQ_ENABLE_FOLLY_FBVECTOR=ON)\n";
+#endif
+    std::cout << "steady_state_multiplier=" << config.steady_state_multiplier
+              << ", steady_state_max_operations=" << config.steady_state_max_operations
+              << ", sparse_reused_priorities=" << config.sparse_reused_priority_count
+              << ", hot_set_probability=" << config.hot_set_probability
+              << '\n'
+              << '\n';
 
     std::cout << std::left
+              << std::setw(13) << "range"
               << std::setw(18) << "workload"
+              << std::setw(15) << "shape"
+              << std::setw(10) << "items"
               << std::setw(10) << "buckets"
-              << std::setw(45) << "container"
+              << std::setw(56) << "container"
               << std::setw(14) << "total ms"
               << std::setw(14) << "ns/op"
               << "checksum"
               << '\n';
 
     for (const auto& result : results) {
-        const auto total_ms = result.seconds * 1'000.0;
-        const auto ns_per_operation = (result.seconds * 1'000'000'000.0) / static_cast<double>(result.operations);
-
         std::cout << std::left
+                  << std::setw(13) << result.range
                   << std::setw(18) << result.workload
+                  << std::setw(15) << result.shape
+                  << std::setw(10) << result.item_count
                   << std::setw(10) << result.bucket_count
-                  << std::setw(45) << result.container
-                  << std::setw(14) << std::fixed << std::setprecision(3) << total_ms
-                  << std::setw(14) << std::fixed << std::setprecision(3) << ns_per_operation
+                  << std::setw(56) << result.container
+                  << std::setw(14) << std::fixed << std::setprecision(3) << (result.seconds * 1'000.0)
+                  << std::setw(14) << std::fixed << std::setprecision(3) << ns_per_operation(result)
                   << result.checksum
                   << '\n';
     }
@@ -655,15 +902,21 @@ void print_results(const benchmark_config& config, std::span<const benchmark_res
 
 int main() {
     const benchmark_config config{};
-    std::vector<benchmark_result> results;
-    results.reserve(64);
+    const auto cases = build_cases(config);
 
-    run_suite<16>(config, results);
-    run_suite<64>(config, results);
-    run_suite<256>(config, results);
-    run_suite<1024>(config, results);
-    run_suite<100000>(config, results);
-    run_edge_case_suite<100000>(config, results);
+    std::vector<benchmark_result> results;
+#if defined(CPP_PQ_HAS_FOLLY_FBVECTOR)
+    constexpr std::size_t benchmark_variant_count = 4;
+#else
+    constexpr std::size_t benchmark_variant_count = 3;
+#endif
+    results.reserve(cases.size() * benchmark_variant_count);
+
+    for (const auto& next_case : cases) {
+        dispatch_bucket_count(next_case.bucket_count, [&]<std::size_t BucketCount>() {
+            run_case<BucketCount>(config, next_case, results);
+        });
+    }
 
     print_results(config, results);
     return 0;
