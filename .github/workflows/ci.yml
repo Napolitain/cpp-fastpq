@@ -27,5 +27,32 @@ jobs:
           c++ --version
           cmake --version
 
-      - name: Run local CI gate
-        run: ./scripts/ci.sh
+      - name: Compile tests directly
+        run: |
+          mkdir -p build/ci
+          c++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -Iinclude \
+            tests/multi_queue_priority_queue_tests.cpp \
+            -o build/ci/cpp_pq_tests
+
+      - name: Run tests directly
+        run: build/ci/cpp_pq_tests
+
+      - name: Compile benchmark directly
+        run: |
+          c++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -Iinclude \
+            benchmarks/benchmark_priority_queues.cpp \
+            -o build/ci/cpp_pq_benchmark
+
+      - name: Configure CMake
+        run: |
+          cmake -S . -B build/ci/cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCPP_PQ_BUILD_TESTS=ON \
+            -DCPP_PQ_BUILD_BENCHMARKS=ON \
+            -DCPP_PQ_ENABLE_FOLLY_FBVECTOR=OFF
+
+      - name: Build CMake targets
+        run: cmake --build build/ci/cmake --parallel
+
+      - name: Run CTest
+        run: ctest --test-dir build/ci/cmake --output-on-failure

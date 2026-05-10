@@ -123,17 +123,27 @@ registered.push(low, 3);
 
 The queues are not synchronized. Protect shared instances with your own lock.
 
-## Local Quality Gate
+## Development Checks
 
-Run the same gate used by GitHub Actions:
+Run the same checks as GitHub Actions:
 
 ```bash
-./scripts/ci.sh
+mkdir -p build/ci
+c++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -Iinclude \
+  tests/multi_queue_priority_queue_tests.cpp \
+  -o build/ci/cpp_pq_tests
+build/ci/cpp_pq_tests
+c++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -Iinclude \
+  benchmarks/benchmark_priority_queues.cpp \
+  -o build/ci/cpp_pq_benchmark
+cmake -S . -B build/ci/cmake \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCPP_PQ_BUILD_TESTS=ON \
+  -DCPP_PQ_BUILD_BENCHMARKS=ON \
+  -DCPP_PQ_ENABLE_FOLLY_FBVECTOR=OFF
+cmake --build build/ci/cmake --parallel
+ctest --test-dir build/ci/cmake --output-on-failure
 ```
-
-It compiles and runs the tests, compiles the benchmark, and when CMake is
-available also configures the project, builds tests and benchmarks, and runs
-`ctest`.
 
 ## Benchmarks
 
