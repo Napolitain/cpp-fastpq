@@ -11,3 +11,4 @@ build-*/
 *.tmp
 *.log
 dynamic_variant_gains.csv
+benchmark_priority_queue_results.csv

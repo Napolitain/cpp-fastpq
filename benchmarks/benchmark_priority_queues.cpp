@@ -10,6 +10,7 @@
 #include <iostream>
 #include <memory>
 #include <queue>
+#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <string>
