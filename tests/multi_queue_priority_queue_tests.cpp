@@ -26,6 +26,17 @@ void expect_out_of_range(Fn&& fn, std::string_view message) {
     throw std::runtime_error(std::string("Expected std::out_of_range: ") + std::string(message));
 }
 
+template <typename Fn>
+void expect_logic_error(Fn&& fn, std::string_view message) {
+    try {
+        fn();
+    } catch (const std::logic_error&) {
+        return;
+    }
+
+    throw std::runtime_error(std::string("Expected std::logic_error: ") + std::string(message));
+}
+
 void test_basic_priority_behavior() {
     cpp_pq::bucket_priority_queue<int, 8> queue;
 
@@ -40,19 +51,19 @@ void test_basic_priority_behavior() {
 
     expect(!queue.empty(), "queue becomes non-empty after pushes");
     expect(queue.size() == 3, "queue tracks size");
-    expect(queue.top() == 60, "highest priority value is returned");
-    expect(queue.top_priority() == 6, "highest priority index is tracked");
+    expect(queue.top() == 10, "lowest numeric priority value is returned");
+    expect(queue.top_priority() == 1, "lowest numeric priority index is tracked");
 
-    queue.push(6, 61);
-    expect(queue.top() == 61, "equal-priority values use latest insertion at the front");
+    queue.push(1, 11);
+    expect(queue.top() == 10, "equal-priority values keep FIFO insertion order");
 
     queue.pop();
     expect(queue.size() == 3, "pop reduces size by one");
-    expect(queue.top() == 60, "removing the newest equal-priority element reveals the previous one");
+    expect(queue.top() == 11, "removing the oldest equal-priority element reveals the next one");
 
-    queue.emplace(7, 70);
+    queue.emplace(0, 70);
     expect(queue.top() == 70, "emplace inserts directly into the correct bucket");
-    expect(queue.top_priority() == 7, "emplace updates the tracked priority");
+    expect(queue.top_priority() == 0, "emplace updates the tracked priority");
 }
 
 void test_clear_and_bounds() {
@@ -74,10 +85,48 @@ void test_alias_type() {
     expect(queue.top() == 99, "multi_queue alias maps to the bucketed implementation");
 }
 
+void test_bulk_priority_behavior() {
+    cpp_pq::bulk_bucket_priority_queue<int, 8> queue;
+
+    queue.push(1, 10);
+    queue.push(6, 60);
+    queue.push(3, 30);
+    queue.push(1, 11);
+
+    expect(queue.top() == 10, "bulk queue returns the lowest numeric priority value");
+    expect(queue.top_priority() == 1, "bulk queue tracks the lowest numeric priority index");
+
+    queue.pop();
+    expect(queue.size() == 3, "bulk pop reduces size by one");
+    expect(queue.top() == 11, "bulk queue preserves FIFO order within a priority");
+
+    queue.pop();
+    expect(queue.top_priority() == 3, "bulk queue scans to the next populated priority");
+}
+
+void test_bulk_rejects_push_during_drain() {
+    cpp_pq::bulk_bucket_priority_queue<int, 4> queue;
+
+    queue.push(3, 30);
+    queue.push(1, 10);
+    queue.pop();
+
+    expect_logic_error([&]() { queue.push(2, 20); }, "bulk push after drain starts");
+
+    queue.pop();
+    expect(queue.empty(), "bulk queue fully drained");
+
+    queue.push(2, 200);
+    expect(queue.top_priority() == 2, "bulk queue accepts a new fill phase after draining");
+}
+
 void test_public_alias_mappings() {
     static_assert(std::is_same_v<
                   cpp_pq::static_bucket_priority_queue<int, 8>,
                   cpp_pq::bucket_priority_queue<int, 8>>);
+    static_assert(std::is_same_v<
+                  cpp_pq::bulk_multi_queue_priority_queue<int, 8>,
+                  cpp_pq::bulk_bucket_priority_queue<int, 8>>);
     static_assert(std::is_same_v<
                   cpp_pq::multi_queue_priority_queue<int, 8>,
                   cpp_pq::bucket_priority_queue<int, 8>>);
@@ -111,8 +160,8 @@ void test_large_static_bucket_count() {
     queue->push(4097, 4097);
     queue->push(99999, 99999);
 
-    expect(queue->top_priority() == 99999, "large static queue tracks a high priority across multiple bitmap levels");
-    expect(queue->top() == 99999, "large static queue returns the highest-priority value");
+    expect(queue->top_priority() == 17, "large static queue tracks a low priority across multiple bitmap levels");
+    expect(queue->top() == 17, "large static queue returns the lowest numeric priority value");
 
     queue->pop();
     expect(queue->top_priority() == 4097, "large static queue falls back to the next populated priority");
@@ -132,8 +181,8 @@ void test_dynamic_growth() {
     queue.push(2, 20);
     queue.emplace(40, 400);
     expect(queue.bucket_count() == 41, "dynamic queue expands again when a larger priority arrives");
-    expect(queue.top() == 400, "dynamic queue returns the highest-priority value after expansion");
-    expect(queue.top_priority() == 40, "dynamic queue reports the grown highest priority");
+    expect(queue.top() == 20, "dynamic queue returns the lowest numeric priority value after expansion");
+    expect(queue.top_priority() == 2, "dynamic queue reports the lowest numeric priority");
 
     queue.pop();
     expect(queue.top_priority() == 12, "dynamic queue falls back correctly after removing the top bucket");
@@ -161,8 +210,8 @@ void test_geometric_dynamic_growth() {
 
     queue.push(40, 400);
     expect(queue.bucket_count() == 41, "geometric dynamic queue grows logically to include the inserted priority");
-    expect(queue.top_priority() == 40, "geometric dynamic queue reports the highest priority");
-    expect(queue.top() == 400, "geometric dynamic queue returns the highest-priority value");
+    expect(queue.top_priority() == 12, "geometric dynamic queue reports the lowest numeric priority");
+    expect(queue.top() == 120, "geometric dynamic queue returns the lowest numeric priority value");
 }
 
 void test_paged_dynamic_sparse_priorities() {
@@ -171,11 +220,11 @@ void test_paged_dynamic_sparse_priorities() {
     queue.push(1, 10);
     queue.push(10000, 20);
     expect(queue.bucket_count() == 10001, "paged dynamic queue tracks the sparse logical range");
-    expect(queue.top_priority() == 10000, "paged dynamic queue finds the highest sparse priority");
-    expect(queue.top() == 20, "paged dynamic queue returns the sparse highest-priority value");
+    expect(queue.top_priority() == 1, "paged dynamic queue finds the lowest sparse priority");
+    expect(queue.top() == 10, "paged dynamic queue returns the sparse lowest-priority value");
 
     queue.pop();
-    expect(queue.top_priority() == 1, "paged dynamic queue falls back across sparse pages");
+    expect(queue.top_priority() == 10000, "paged dynamic queue falls back across sparse pages");
 }
 
 void test_paged_geometric_dynamic_sparse_priorities() {
@@ -185,8 +234,8 @@ void test_paged_geometric_dynamic_sparse_priorities() {
     queue.push(4097, 4097);
     queue.push(99999, 99999);
     expect(queue.bucket_count() == 100000, "paged geometric queue tracks the logical sparse range");
-    expect(queue.top_priority() == 99999, "paged geometric queue returns the highest sparse priority");
-    expect(queue.top() == 99999, "paged geometric queue returns the highest-priority value");
+    expect(queue.top_priority() == 5, "paged geometric queue returns the lowest sparse priority");
+    expect(queue.top() == 50, "paged geometric queue returns the lowest-priority value");
 
     queue.clear();
     expect(queue.empty(), "paged geometric queue clear removes all queued items");
@@ -206,11 +255,11 @@ void test_registered_sparse_priorities() {
     queue.push(low, 10);
     queue.push(high, 20);
 
-    expect(queue.top_priority() == 10000, "registered queue returns the highest sparse priority");
-    expect(queue.top() == 20, "registered queue returns the highest-priority value");
+    expect(queue.top_priority() == 1, "registered queue returns the lowest sparse priority");
+    expect(queue.top() == 10, "registered queue returns the lowest-priority value");
 
     queue.pop();
-    expect(queue.top_priority() == 1, "registered queue falls back to the next registered sparse priority");
+    expect(queue.top_priority() == 10000, "registered queue falls back to the next registered sparse priority");
 }
 
 void test_registered_handles_survive_clear() {
@@ -255,6 +304,8 @@ int main() {
         test_basic_priority_behavior();
         test_clear_and_bounds();
         test_alias_type();
+        test_bulk_priority_behavior();
+        test_bulk_rejects_push_during_drain();
         test_public_alias_mappings();
         test_large_static_bucket_count();
         test_dynamic_growth();

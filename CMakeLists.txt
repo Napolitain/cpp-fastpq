@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.24)
 project(
     cpp_pq
     VERSION 0.1.0
-    DESCRIPTION "Bounded-priority multi-queue priority queue with benchmarks"
+    DESCRIPTION "Bucket-based bounded-priority queue variants with benchmarks"
     LANGUAGES CXX
 )
 

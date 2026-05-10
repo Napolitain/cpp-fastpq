@@ -5,6 +5,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <memory>
 #include <queue>
 #include <stdexcept>
@@ -30,8 +31,8 @@ inline constexpr std::size_t occupancy_word_bits = 64;
     return std::uint64_t{1} << (bit_index % occupancy_word_bits);
 }
 
-[[nodiscard]] inline constexpr std::size_t highest_bit_index(std::uint64_t value) noexcept {
-    return (occupancy_word_bits - 1) - static_cast<std::size_t>(std::countl_zero(value));
+[[nodiscard]] inline constexpr std::size_t lowest_bit_index(std::uint64_t value) noexcept {
+    return static_cast<std::size_t>(std::countr_zero(value));
 }
 
 [[nodiscard]] inline std::size_t geometric_capacity(std::size_t required_capacity) noexcept {
@@ -41,6 +42,71 @@ inline constexpr std::size_t occupancy_word_bits = 64;
 
     return std::bit_ceil(std::max(required_capacity, occupancy_word_bits));
 }
+
+template <typename T, template <typename, typename> class BucketContainer = std::vector>
+class fifo_bucket {
+public:
+    using value_type = T;
+    using container_type = BucketContainer<T, std::allocator<T>>;
+
+    [[nodiscard]] bool empty() const noexcept {
+        return head_ >= values_.size();
+    }
+
+    [[nodiscard]] value_type& front() {
+        return values_[head_];
+    }
+
+    [[nodiscard]] const value_type& front() const {
+        return values_[head_];
+    }
+
+    template <typename U>
+    void push(U&& value) {
+        values_.push_back(std::forward<U>(value));
+    }
+
+    template <typename... Args>
+    value_type& emplace(Args&&... args) {
+        values_.emplace_back(std::forward<Args>(args)...);
+        return values_.back();
+    }
+
+    void pop() {
+        ++head_;
+
+        if (empty()) {
+            clear();
+            return;
+        }
+
+        compact_if_needed();
+    }
+
+    void clear() {
+        values_.clear();
+        head_ = 0;
+    }
+
+private:
+    static constexpr std::size_t min_compact_head = 64;
+
+    void compact_if_needed() {
+        if (head_ < min_compact_head || (head_ * 2) < values_.size()) {
+            return;
+        }
+
+        container_type compacted;
+        compacted.reserve(values_.size() - head_);
+        const auto active_begin = values_.begin() + static_cast<typename container_type::difference_type>(head_);
+        std::move(active_begin, values_.end(), std::back_inserter(compacted));
+        values_ = std::move(compacted);
+        head_ = 0;
+    }
+
+    container_type values_{};
+    std::size_t head_{0};
+};
 
 template <std::size_t BucketCount>
 class static_bucket_index {
@@ -152,16 +218,16 @@ public:
         }
     }
 
-    [[nodiscard]] std::size_t highest_set_bit() const noexcept {
+    [[nodiscard]] std::size_t lowest_set_bit() const noexcept {
         std::size_t current_word_index = 0;
 
         for (std::size_t level = level_count - 1; level > 0; --level) {
             const auto word = level_data(level)[current_word_index];
-            current_word_index = (current_word_index * occupancy_word_bits) + highest_bit_index(word);
+            current_word_index = (current_word_index * occupancy_word_bits) + lowest_bit_index(word);
         }
 
         const auto leaf_word = level_data(0)[current_word_index];
-        return (current_word_index * occupancy_word_bits) + highest_bit_index(leaf_word);
+        return (current_word_index * occupancy_word_bits) + lowest_bit_index(leaf_word);
     }
 
 private:
@@ -252,16 +318,16 @@ public:
         }
     }
 
-    [[nodiscard]] std::size_t highest_set_bit() const noexcept {
+    [[nodiscard]] std::size_t lowest_set_bit() const noexcept {
         std::size_t current_word_index = 0;
 
         for (std::size_t level = levels_.size() - 1; level > 0; --level) {
             const auto word = levels_[level][current_word_index];
-            current_word_index = (current_word_index * occupancy_word_bits) + highest_bit_index(word);
+            current_word_index = (current_word_index * occupancy_word_bits) + lowest_bit_index(word);
         }
 
         const auto leaf_word = levels_.front()[current_word_index];
-        return (current_word_index * occupancy_word_bits) + highest_bit_index(leaf_word);
+        return (current_word_index * occupancy_word_bits) + lowest_bit_index(leaf_word);
     }
 
 private:
@@ -308,6 +374,9 @@ private:
 
 } // namespace detail
 
+// Live fixed-range queue. Use when push/pop operations can be interleaved and
+// the priority range is known at compile time. Lower numeric priorities are
+// returned first. Equal-priority values are popped FIFO.
 template <typename T, std::size_t BucketCount>
 class bucket_priority_queue {
     static_assert(BucketCount > 0, "bucket_priority_queue requires at least one bucket");
@@ -316,7 +385,7 @@ public:
     using value_type = T;
     using size_type = std::size_t;
     using priority_type = std::size_t;
-    using bucket_type = std::vector<T>;
+    using bucket_type = detail::fifo_bucket<T>;
 
     [[nodiscard]] static constexpr size_type bucket_count() noexcept {
         return BucketCount;
@@ -350,8 +419,12 @@ public:
     template <typename U>
     void push(priority_type priority, U&& value) {
         validate_priority(priority);
-        buckets_[priority].push_back(std::forward<U>(value));
-        occupancy_.set(priority);
+        auto& bucket = buckets_[priority];
+        const auto was_empty = bucket.empty();
+        bucket.push(std::forward<U>(value));
+        if (was_empty) {
+            occupancy_.set(priority);
+        }
         ++size_;
     }
 
@@ -359,28 +432,31 @@ public:
     value_type& emplace(priority_type priority, Args&&... args) {
         validate_priority(priority);
         auto& bucket = buckets_[priority];
-        bucket.emplace_back(std::forward<Args>(args)...);
-        occupancy_.set(priority);
+        const auto was_empty = bucket.empty();
+        auto& value = bucket.emplace(std::forward<Args>(args)...);
+        if (was_empty) {
+            occupancy_.set(priority);
+        }
         ++size_;
-        return bucket.back();
+        return value;
     }
 
     [[nodiscard]] value_type& top() {
-        return bucket_for_top().back();
+        return bucket_for_top().front();
     }
 
     [[nodiscard]] const value_type& top() const {
-        return bucket_for_top().back();
+        return bucket_for_top().front();
     }
 
     [[nodiscard]] priority_type top_priority() const {
-        return highest_non_empty_priority();
+        return top_non_empty_priority();
     }
 
     void pop() {
-        const auto priority = highest_non_empty_priority();
+        const auto priority = top_non_empty_priority();
         auto& bucket = buckets_[priority];
-        bucket.pop_back();
+        bucket.pop();
         --size_;
 
         if (bucket.empty()) {
@@ -390,11 +466,11 @@ public:
 
 private:
     [[nodiscard]] bucket_type& bucket_for_top() {
-        return buckets_[highest_non_empty_priority()];
+        return buckets_[top_non_empty_priority()];
     }
 
     [[nodiscard]] const bucket_type& bucket_for_top() const {
-        return buckets_[highest_non_empty_priority()];
+        return buckets_[top_non_empty_priority()];
     }
 
     void validate_priority(priority_type priority) const {
@@ -403,12 +479,12 @@ private:
         }
     }
 
-    [[nodiscard]] priority_type highest_non_empty_priority() const {
+    [[nodiscard]] priority_type top_non_empty_priority() const {
         if (empty()) {
             throw std::out_of_range("bucket_priority_queue is empty");
         }
 
-        return occupancy_.highest_set_bit();
+        return occupancy_.lowest_set_bit();
     }
 
     std::array<bucket_type, BucketCount> buckets_{};
@@ -416,22 +492,175 @@ private:
     size_type size_{0};
 };
 
+// Fill-then-drain fixed-range queue. Use when all pushes for a batch complete
+// before popping begins. It avoids maintaining live occupancy metadata and only
+// scans buckets while moving between priorities, giving total drain work of
+// O(items + buckets). Push throws std::logic_error if called while a non-empty
+// drain phase is in progress.
+template <typename T, std::size_t BucketCount>
+class bulk_bucket_priority_queue {
+    static_assert(BucketCount > 0, "bulk_bucket_priority_queue requires at least one bucket");
+
+public:
+    using value_type = T;
+    using size_type = std::size_t;
+    using priority_type = std::size_t;
+    using bucket_type = detail::fifo_bucket<T>;
+
+    [[nodiscard]] static constexpr size_type bucket_count() noexcept {
+        return BucketCount;
+    }
+
+    [[nodiscard]] static constexpr priority_type min_priority() noexcept {
+        return 0;
+    }
+
+    [[nodiscard]] static constexpr priority_type max_priority() noexcept {
+        return BucketCount - 1;
+    }
+
+    [[nodiscard]] bool empty() const noexcept {
+        return size_ == 0;
+    }
+
+    [[nodiscard]] size_type size() const noexcept {
+        return size_;
+    }
+
+    void clear() {
+        for (auto& bucket : buckets_) {
+            bucket.clear();
+        }
+
+        size_ = 0;
+        cursor_ = min_priority();
+        draining_ = false;
+    }
+
+    template <typename U>
+    void push(priority_type priority, U&& value) {
+        validate_priority(priority);
+        prepare_for_push();
+        buckets_[priority].push(std::forward<U>(value));
+        ++size_;
+    }
+
+    template <typename... Args>
+    value_type& emplace(priority_type priority, Args&&... args) {
+        validate_priority(priority);
+        prepare_for_push();
+        auto& bucket = buckets_[priority];
+        auto& value = bucket.emplace(std::forward<Args>(args)...);
+        ++size_;
+        return value;
+    }
+
+    [[nodiscard]] value_type& top() {
+        return bucket_for_top().front();
+    }
+
+    [[nodiscard]] const value_type& top() const {
+        return bucket_for_top().front();
+    }
+
+    [[nodiscard]] priority_type top_priority() const {
+        return top_non_empty_priority();
+    }
+
+    void pop() {
+        const auto priority = top_non_empty_priority();
+        auto& bucket = buckets_[priority];
+        bucket.pop();
+        --size_;
+
+        if (bucket.empty() && size_ != 0) {
+            ++cursor_;
+            advance_cursor();
+        }
+    }
+
+private:
+    void prepare_for_push() {
+        if (!draining_) {
+            return;
+        }
+        if (size_ != 0) {
+            throw std::logic_error("bulk_bucket_priority_queue cannot be pushed while draining");
+        }
+
+        draining_ = false;
+        cursor_ = min_priority();
+    }
+
+    void start_drain() const {
+        if (!draining_) {
+            draining_ = true;
+            cursor_ = min_priority();
+        }
+
+        advance_cursor();
+    }
+
+    void advance_cursor() const noexcept {
+        while (cursor_ < BucketCount && buckets_[cursor_].empty()) {
+            ++cursor_;
+        }
+    }
+
+    [[nodiscard]] bucket_type& bucket_for_top() {
+        return buckets_[top_non_empty_priority()];
+    }
+
+    [[nodiscard]] const bucket_type& bucket_for_top() const {
+        return buckets_[top_non_empty_priority()];
+    }
+
+    void validate_priority(priority_type priority) const {
+        if (priority >= BucketCount) {
+            throw std::out_of_range("priority is out of range for bulk_bucket_priority_queue");
+        }
+    }
+
+    [[nodiscard]] priority_type top_non_empty_priority() const {
+        if (empty()) {
+            throw std::out_of_range("bulk_bucket_priority_queue is empty");
+        }
+
+        start_drain();
+        return cursor_;
+    }
+
+    std::array<bucket_type, BucketCount> buckets_{};
+    mutable size_type cursor_{0};
+    size_type size_{0};
+    mutable bool draining_{false};
+};
+
 template <typename T, std::size_t BucketCount>
 using static_bucket_priority_queue = bucket_priority_queue<T, BucketCount>;
+
+template <typename T, std::size_t BucketCount>
+using bulk_multi_queue_priority_queue = bulk_bucket_priority_queue<T, BucketCount>;
 
 template <typename T, std::size_t BucketCount>
 using multi_queue_priority_queue = bucket_priority_queue<T, BucketCount>;
 
 // Advanced customization point. Prefer the aliases below in application code so the
 // dynamic queue internals can evolve without forcing call-site changes. BucketContainer
-// is expected to be a template<Value, Allocator> with vector-like append/back semantics.
+// is expected to be a template<Value, Allocator> with vector-like append,
+// iteration, reserve, and move-assignment semantics.
+//
+// Live dynamic-range queue. Use when push/pop operations can be interleaved and
+// the priority range is not fully known up front. The exact-growth alias grows
+// to the requested logical range; the default geometric alias keeps spare bucket
+// capacity to reduce repeated reallocations.
 template <typename T, bool GeometricGrowth, template <typename, typename> class BucketContainer = std::vector>
 class dynamic_bucket_priority_queue_base {
 public:
     using value_type = T;
     using size_type = std::size_t;
     using priority_type = std::size_t;
-    using bucket_type = BucketContainer<T, std::allocator<T>>;
+    using bucket_type = detail::fifo_bucket<T, BucketContainer>;
 
     explicit dynamic_bucket_priority_queue_base(size_type bucket_count = 0) {
         expand_priorities(bucket_count);
@@ -474,8 +703,12 @@ public:
     template <typename U>
     void push(priority_type priority, U&& value) {
         ensure_priority(priority);
-        buckets_[priority].push_back(std::forward<U>(value));
-        occupancy_.set(priority);
+        auto& bucket = buckets_[priority];
+        const auto was_empty = bucket.empty();
+        bucket.push(std::forward<U>(value));
+        if (was_empty) {
+            occupancy_.set(priority);
+        }
         ++size_;
     }
 
@@ -483,28 +716,31 @@ public:
     value_type& emplace(priority_type priority, Args&&... args) {
         ensure_priority(priority);
         auto& bucket = buckets_[priority];
-        bucket.emplace_back(std::forward<Args>(args)...);
-        occupancy_.set(priority);
+        const auto was_empty = bucket.empty();
+        auto& value = bucket.emplace(std::forward<Args>(args)...);
+        if (was_empty) {
+            occupancy_.set(priority);
+        }
         ++size_;
-        return bucket.back();
+        return value;
     }
 
     [[nodiscard]] value_type& top() {
-        return bucket_for_top().back();
+        return bucket_for_top().front();
     }
 
     [[nodiscard]] const value_type& top() const {
-        return bucket_for_top().back();
+        return bucket_for_top().front();
     }
 
     [[nodiscard]] priority_type top_priority() const {
-        return highest_non_empty_priority();
+        return top_non_empty_priority();
     }
 
     void pop() {
-        const auto priority = highest_non_empty_priority();
+        const auto priority = top_non_empty_priority();
         auto& bucket = buckets_[priority];
-        bucket.pop_back();
+        bucket.pop();
         --size_;
 
         if (bucket.empty()) {
@@ -530,19 +766,19 @@ private:
     }
 
     [[nodiscard]] bucket_type& bucket_for_top() {
-        return buckets_[highest_non_empty_priority()];
+        return buckets_[top_non_empty_priority()];
     }
 
     [[nodiscard]] const bucket_type& bucket_for_top() const {
-        return buckets_[highest_non_empty_priority()];
+        return buckets_[top_non_empty_priority()];
     }
 
-    [[nodiscard]] priority_type highest_non_empty_priority() const {
+    [[nodiscard]] priority_type top_non_empty_priority() const {
         if (empty()) {
             throw std::out_of_range("dynamic_bucket_priority_queue is empty");
         }
 
-        return occupancy_.highest_set_bit();
+        return occupancy_.lowest_set_bit();
     }
 
     std::vector<bucket_type> buckets_{};
@@ -567,6 +803,9 @@ using dynamic_multi_queue_priority_queue = dynamic_bucket_priority_queue<T>;
 
 // Advanced sparse-range customization point. Prefer the aliases below in application
 // code unless you intentionally want to opt into a specific paged growth policy.
+//
+// Live sparse-range queue. Use when the logical priority range can be large but
+// active priorities tend to cluster into a limited number of 64-priority pages.
 template <typename T, bool GeometricGrowth>
 class paged_dynamic_bucket_priority_queue_base {
     static constexpr std::size_t page_bucket_count = detail::occupancy_word_bits;
@@ -575,7 +814,7 @@ public:
     using value_type = T;
     using size_type = std::size_t;
     using priority_type = std::size_t;
-    using bucket_type = std::vector<T>;
+    using bucket_type = detail::fifo_bucket<T>;
 
     explicit paged_dynamic_bucket_priority_queue_base(size_type bucket_count = 0) {
         expand_priorities(bucket_count);
@@ -632,7 +871,7 @@ public:
         auto& page = ensure_page(next_page_index);
         auto& bucket = page.buckets_[next_bucket_offset];
         const auto bucket_was_empty = bucket.empty();
-        bucket.push_back(std::forward<U>(value));
+        bucket.push(std::forward<U>(value));
 
         if (bucket_was_empty) {
             page.occupancy_mask_ |= detail::bit_mask(next_bucket_offset);
@@ -651,7 +890,7 @@ public:
         auto& page = ensure_page(next_page_index);
         auto& bucket = page.buckets_[next_bucket_offset];
         const auto bucket_was_empty = bucket.empty();
-        bucket.emplace_back(std::forward<Args>(args)...);
+        auto& value = bucket.emplace(std::forward<Args>(args)...);
 
         if (bucket_was_empty) {
             page.occupancy_mask_ |= detail::bit_mask(next_bucket_offset);
@@ -659,26 +898,26 @@ public:
         }
 
         ++size_;
-        return bucket.back();
+        return value;
     }
 
     [[nodiscard]] value_type& top() {
-        return bucket_for_priority(highest_non_empty_priority()).back();
+        return bucket_for_priority(top_non_empty_priority()).front();
     }
 
     [[nodiscard]] const value_type& top() const {
-        return bucket_for_priority(highest_non_empty_priority()).back();
+        return bucket_for_priority(top_non_empty_priority()).front();
     }
 
     [[nodiscard]] priority_type top_priority() const {
-        return highest_non_empty_priority();
+        return top_non_empty_priority();
     }
 
     void pop() {
-        const auto priority = highest_non_empty_priority();
+        const auto priority = top_non_empty_priority();
         auto& page = *pages_[page_index(priority)];
         auto& bucket = page.buckets_[bucket_offset(priority)];
-        bucket.pop_back();
+        bucket.pop();
         --size_;
 
         if (bucket.empty()) {
@@ -743,15 +982,15 @@ private:
         return pages_[page_index(priority)]->buckets_[bucket_offset(priority)];
     }
 
-    [[nodiscard]] priority_type highest_non_empty_priority() const {
+    [[nodiscard]] priority_type top_non_empty_priority() const {
         if (empty()) {
             throw std::out_of_range("paged_dynamic_bucket_priority_queue is empty");
         }
 
-        const auto highest_page_index = non_empty_pages_.highest_set_bit();
-        const auto& page = *pages_[highest_page_index];
-        const auto highest_bucket_offset = detail::highest_bit_index(page.occupancy_mask_);
-        return (highest_page_index * page_bucket_count) + highest_bucket_offset;
+        const auto lowest_page_index = non_empty_pages_.lowest_set_bit();
+        const auto& page = *pages_[lowest_page_index];
+        const auto lowest_bucket_offset = detail::lowest_bit_index(page.occupancy_mask_);
+        return (lowest_page_index * page_bucket_count) + lowest_bucket_offset;
     }
 
     std::vector<std::unique_ptr<page_state>> pages_{};
@@ -767,6 +1006,9 @@ using paged_dynamic_bucket_priority_queue = paged_dynamic_bucket_priority_queue_
 template <typename T>
 using paged_dynamic_bucket_priority_queue_geometric = paged_dynamic_bucket_priority_queue_base<T, true>;
 
+// Registered sparse queue. Use when the application can register the small set
+// of priorities it will reuse and pass handles on push/emplace. This avoids
+// materializing the full priority range and skips per-push range growth checks.
 template <typename T>
 class registered_bucket_priority_queue {
 private:
@@ -776,7 +1018,7 @@ public:
     using value_type = T;
     using size_type = std::size_t;
     using priority_type = std::size_t;
-    using bucket_type = std::vector<T>;
+    using bucket_type = detail::fifo_bucket<T>;
 
     struct priority_handle {
         priority_handle() = default;
@@ -868,7 +1110,7 @@ public:
         validate_handle(handle);
         auto& bucket = bucket_for(handle);
         const auto bucket_was_empty = bucket.empty();
-        bucket.push_back(std::forward<U>(value));
+        bucket.push(std::forward<U>(value));
 
         if (bucket_was_empty) {
             mark_non_empty(handle);
@@ -882,32 +1124,32 @@ public:
         validate_handle(handle);
         auto& bucket = bucket_for(handle);
         const auto bucket_was_empty = bucket.empty();
-        bucket.emplace_back(std::forward<Args>(args)...);
+        auto& value = bucket.emplace(std::forward<Args>(args)...);
 
         if (bucket_was_empty) {
             mark_non_empty(handle);
         }
 
         ++size_;
-        return bucket.back();
+        return value;
     }
 
     [[nodiscard]] value_type& top() {
-        return bucket_for(highest_non_empty_handle()).back();
+        return bucket_for(top_non_empty_handle()).front();
     }
 
     [[nodiscard]] const value_type& top() const {
-        return bucket_for(highest_non_empty_handle()).back();
+        return bucket_for(top_non_empty_handle()).front();
     }
 
     [[nodiscard]] priority_type top_priority() const {
-        return highest_non_empty_handle().priority_;
+        return top_non_empty_handle().priority_;
     }
 
     void pop() {
-        const auto handle = highest_non_empty_handle();
+        const auto handle = top_non_empty_handle();
         auto& bucket = bucket_for(handle);
-        bucket.pop_back();
+        bucket.pop();
         --size_;
 
         if (bucket.empty()) {
@@ -932,9 +1174,9 @@ private:
         std::size_t activation_generation{0};
     };
 
-    struct higher_page {
+    struct lower_page {
         [[nodiscard]] bool operator()(const active_page_entry& left, const active_page_entry& right) const noexcept {
-            return left.page->page_index_ < right.page->page_index_;
+            return left.page->page_index_ > right.page->page_index_;
         }
     };
 
@@ -981,14 +1223,14 @@ private:
         }
     }
 
-    [[nodiscard]] priority_handle highest_non_empty_handle() const {
+    [[nodiscard]] priority_handle top_non_empty_handle() const {
         if (empty()) {
             throw std::out_of_range("registered_bucket_priority_queue is empty");
         }
 
         refresh_active_pages();
         const auto& page = *active_pages_.top().page;
-        const auto bucket_offset = detail::highest_bit_index(page.occupancy_mask_);
+        const auto bucket_offset = detail::lowest_bit_index(page.occupancy_mask_);
 
         return priority_handle(
             this,
@@ -1000,7 +1242,7 @@ private:
 
     std::unordered_map<priority_type, priority_handle> registry_{};
     std::unordered_map<std::size_t, std::unique_ptr<page_state>> pages_{};
-    mutable std::priority_queue<active_page_entry, std::vector<active_page_entry>, higher_page> active_pages_{};
+    mutable std::priority_queue<active_page_entry, std::vector<active_page_entry>, lower_page> active_pages_{};
     size_type size_{0};
 };
 
